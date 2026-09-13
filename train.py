@@ -5,6 +5,7 @@ Training script for path prediction diffusion model.
 import argparse
 import math
 import os
+import random
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -16,7 +17,9 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from data_preprocessing import prepare_datasets
-from diffusion_model import PathDiffusionModel
+from diffusion_model import (
+    PathDiffusionModel, generate_constraint_mask, MIN_CONSTRAINT_SPACING, MODEL_FORMAT_VERSION
+)
 
 
 class AdamAtan2(torch.optim.Optimizer):
@@ -81,7 +84,7 @@ class DiffusionTrainer:
         weight_decay: float = 1e-6,
         ema_decay: float = 0.995,
         ema_interval: int = 10,
-        save_dir: str = './checkpoints'
+        save_dir: str = './checkpoints_kimodo'
     ):
         self.model = model
         self.train_loader = train_loader
@@ -121,7 +124,9 @@ class DiffusionTrainer:
         # Training state
         self.global_step = 0
         self.current_epoch = 0
+        self.next_epoch = 0
         self.best_val_loss = float('inf')
+        self.best_ema_snapshot = None
 
     def _canonicalize(self, target: torch.Tensor) -> torch.Tensor:
         """Translate each sequence so its first point is at the origin.
@@ -149,10 +154,12 @@ class DiffusionTrainer:
         return target
 
     def compute_loss(self, batch: Dict) -> torch.Tensor:
-        """Compute diffusion loss, masked over valid (non-padded) positions.
+        """Compute clean-trajectory L1 loss over valid (non-padded) positions.
 
         The first and last valid point of each sequence are always constrained:
-        no noise is added at those positions (Kimodo-style constraints).
+        clean features are imputed and their mask is concatenated in the denoiser.
+        Random interior frames are also constrained in all four features, with
+        at least 60 frames between every pair of adjacent constraints.
         """
         target = batch['target'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)  # (B, T_pred): 1=valid, 0=padding
@@ -167,26 +174,18 @@ class DiffusionTrainer:
         timesteps = torch.randint(0, num_timesteps, (batch_size,), device=self.device)
 
         # Constraint mask: first and last valid position of each sequence
-        constraint_mask = torch.zeros_like(attention_mask)
-        constraint_mask[:, 0] = 1
-        last_idx = (attention_mask.sum(dim=1).long() - 1).clamp(min=0)
-        constraint_mask[torch.arange(batch_size, device=self.device), last_idx] = 1
+        constraint_mask = generate_constraint_mask(attention_mask)
 
-        # Sample noise and enforce constraints (zero noise at constrained positions)
-        noise = torch.randn_like(target)
-        noise = noise * (1 - constraint_mask.unsqueeze(-1))
-        noisy_target = self.model.diffusion.q_sample(target, timesteps, noise)
+        # Sample noise and impute clean constraints in the model's training forward
+        valid = attention_mask.bool()
 
         # Forward pass
-        noise_pred = self.model.denoiser(
-            noisy_target, timesteps, attention_mask=attention_mask
+        clean_pred = self.model(
+            target, timesteps, constraint_mask=constraint_mask, attention_mask=attention_mask
         )
 
-        # Masked MSE loss: padded positions contribute nothing
-        mask_expanded = attention_mask.unsqueeze(-1).expand_as(noise_pred)
-        loss = nn.functional.mse_loss(
-            noise_pred * mask_expanded, noise * mask_expanded, reduction='sum'
-        ) / mask_expanded.sum()
+        # Masked L1 reconstruction loss: padded positions contribute nothing
+        loss = nn.functional.l1_loss(clean_pred[valid], target[valid])
 
         return loss
     
@@ -204,7 +203,7 @@ class DiffusionTrainer:
         total_loss = 0.0
         num_batches = 0
         
-        pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
+        pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1}")
         for batch in pbar:
             self.optimizer.zero_grad()
             
@@ -226,6 +225,7 @@ class DiffusionTrainer:
             
             pbar.set_postfix({'loss': loss.item(), 'lr': self.optimizer.param_groups[0]['lr']})
         
+        self.next_epoch = self.current_epoch + 1
         return total_loss / num_batches
     
     @torch.no_grad()
@@ -253,11 +253,23 @@ class DiffusionTrainer:
 
         return total_loss / num_batches
     
-    def save_checkpoint(self, filename: str = 'best_model.pt'):
-        """Save model checkpoint."""
+    def save_checkpoint(self, filename: str = 'best_model.pt', update_latest: bool = True):
+        """Atomically save a resumable checkpoint and update latest.pt."""
+        numpy_rng = np.random.get_state()
         checkpoint = {
-            'epoch': self.current_epoch,
+            'format_version': MODEL_FORMAT_VERSION,
+            'prediction_type': 'x0',
+            'constraint_conditioning': 'clean_imputation_mask',
+            'model_config': dict(self.model.config),
+            'epoch': self.next_epoch - 1,
+            'next_epoch': self.next_epoch,
             'global_step': self.global_step,
+            'ema_decay': self.ema_decay,
+            'ema_interval': self.ema_interval,
+            'torch_rng_state': torch.get_rng_state(),
+            'numpy_rng_state': (numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]),
+            'python_rng_state': random.getstate(),
+            'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
             # EMA weights are saved as model_state_dict: they are what gets
             # deployed at test time
             'model_state_dict': dict(self.ema_params),
@@ -267,15 +279,24 @@ class DiffusionTrainer:
             'best_val_loss': self.best_val_loss
         }
 
-        path = self.save_dir / filename
-        torch.save(checkpoint, path)
-        print(f"Saved checkpoint to {path}")
+        paths = [self.save_dir / filename]
+        if update_latest:
+            paths.append(self.save_dir / 'latest.pt')
+        for path in dict.fromkeys(paths):
+            temporary_path = path.with_suffix(path.suffix + '.tmp')
+            torch.save(checkpoint, temporary_path)
+            os.replace(temporary_path, path)
+            print(f"Saved checkpoint to {path}")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        """Restore training state and continue after the last completed epoch."""
+        if checkpoint_path == 'latest':
+            checkpoint_path = self.save_dir / 'latest.pt'
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        if PathDiffusionModel.checkpoint_config(checkpoint) != self.model.config:
+            raise ValueError('Resume model configuration must match the saved model_config')
         
-        # Backward compatible: older checkpoints only have 'model_state_dict'
+        # Prefer raw training weights over the EMA inference weights when resuming
         self.model.load_state_dict(
             checkpoint.get('raw_model_state_dict', checkpoint['model_state_dict'])
         )
@@ -288,40 +309,80 @@ class DiffusionTrainer:
                 name: p.detach().clone() for name, p in self.model.named_parameters()
             }
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.current_epoch = checkpoint['epoch']
+        self.next_epoch = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
+        self.current_epoch = self.next_epoch
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
+        self.best_ema_snapshot = None
+        self.ema_decay = checkpoint.get('ema_decay', self.ema_decay)
+        self.ema_interval = checkpoint.get('ema_interval', self.ema_interval)
+        if 'torch_rng_state' in checkpoint:
+            torch.set_rng_state(checkpoint['torch_rng_state'].cpu())
+        if 'numpy_rng_state' in checkpoint:
+            name, keys, position, has_gauss, cached = checkpoint['numpy_rng_state']
+            np.random.set_state((name, np.asarray(keys, dtype=np.uint32), position, has_gauss, cached))
+        if 'python_rng_state' in checkpoint:
+            random.setstate(checkpoint['python_rng_state'])
+        cuda_rng = checkpoint.get('cuda_rng_state', [])
+        if cuda_rng and torch.cuda.is_available():
+            if len(cuda_rng) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng])
+            else:
+                print('CUDA device count changed; CUDA RNG state was not restored.')
         
         print(f"Loaded checkpoint from {checkpoint_path}")
-        print(f"Resuming from epoch {self.current_epoch}, step {self.global_step}")
+        print(f"Resuming at epoch {self.next_epoch + 1} ({self.next_epoch} completed), step {self.global_step}")
     
-    def train(self, num_epochs: int, val_every: int = 1):
-        """Train the model for multiple epochs."""
-        print(f"Starting training for {num_epochs} epochs")
+    def train(self, num_epochs: int, val_every: int = 1, save_every: int = 50):
+        """Train to a total epoch count, saving best, periodic, and final checkpoints."""
+        if num_epochs < 0 or val_every < 1 or save_every < 1:
+            raise ValueError('num_epochs must be nonnegative; val_every and save_every must be positive')
+        print(f"Training to {num_epochs} total epochs ({self.next_epoch} already completed)")
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         print(f"Optimizer: Adam-atan2, constant lr = {self.optimizer.param_groups[0]['lr']}")
         print(f"EMA: decay = {self.ema_decay}, every {self.ema_interval} steps")
         
-        for epoch in range(self.current_epoch, num_epochs):
+        for epoch in range(self.next_epoch, num_epochs):
             self.current_epoch = epoch
             
             # Train
             train_loss = self.train_epoch()
-            print(f"Epoch {epoch}: Train loss = {train_loss:.6f}")
+            self.next_epoch = epoch + 1
+            print(f"Epoch {epoch + 1}: Train loss = {train_loss:.6f}")
             self.writer.add_scalar('loss/train', train_loss, epoch)
             self.writer.add_scalar('lr', self.optimizer.param_groups[0]['lr'], epoch)
 
             # Validate
             if (epoch + 1) % val_every == 0:
                 val_loss = self.validate()
-                print(f"Epoch {epoch}: Val loss = {val_loss:.6f}")
+                print(f"Epoch {epoch + 1}: Val loss = {val_loss:.6f}")
                 self.writer.add_scalar('loss/val', val_loss, epoch)
 
-                # Save best model only
+                # Snapshot the EMA weights when validation improves; they are
+                # written to best_model.pt at the next checkpoint save
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
-                    self.save_checkpoint('best_model.pt')
+                    self.best_ema_snapshot = {
+                        name: p.detach().clone() for name, p in self.ema_params.items()
+                    }
+
+            # Checkpoints are written every save_every completed epochs, plus
+            # the final epoch: a numbered file (or latest.pt) and best_model.pt
+            # when validation improved since the previous save
+            if self.next_epoch % save_every == 0 or self.next_epoch == num_epochs:
+                if self.next_epoch % save_every == 0:
+                    self.save_checkpoint(f'epoch_{self.next_epoch:04d}.pt')
+                else:
+                    self.save_checkpoint('latest.pt')
+                if self.best_ema_snapshot is not None:
+                    ema_params = self.ema_params
+                    self.ema_params = self.best_ema_snapshot
+                    try:
+                        self.save_checkpoint('best_model.pt', update_latest=False)
+                    finally:
+                        self.ema_params = ema_params
+                    self.best_ema_snapshot = None
         
         self.writer.close()
         print("Training completed!")
@@ -332,10 +393,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train diffusion model for path prediction')
     parser.add_argument('--data_dir', type=str, default='./data', help='Data directory')
     parser.add_argument('--motion_data_dir', type=str, default='../motion_2/data', help='Motion data directory')
-    parser.add_argument('--min_prediction_length', type=int, default=20, help='Minimum prediction length')
+    parser.add_argument('--min_prediction_length', type=int, default=120, help='Minimum prediction length (at least 61)')
     parser.add_argument('--max_prediction_length', type=int, default=600, help='Maximum prediction length (padded tensor size)')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--num_epochs', type=int, default=100, help='Total target epochs, including epochs already completed on resume')
     parser.add_argument('--learning_rate', type=float, default=2e-5, help='Learning rate')
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=6, help='Number of transformer layers')
@@ -343,11 +404,20 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--num_timesteps', type=int, default=1000, help='Number of diffusion timesteps')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Checkpoint directory')
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_kimodo', help='Checkpoint directory')
+    parser.add_argument('--resume', type=str, default=None, help='Checkpoint path, or latest to load <save_dir>/latest.pt')
     parser.add_argument('--val_every', type=int, default=1, help='Validate every N epochs')
+    parser.add_argument('--save_every', type=int, default=50, help='Save a numbered checkpoint every N completed epochs')
     
     args = parser.parse_args()
+    if not MIN_CONSTRAINT_SPACING < args.min_prediction_length <= args.max_prediction_length:
+        parser.error('Require 61 <= min_prediction_length <= max_prediction_length')
+    if args.num_epochs < 0 or args.val_every < 1 or args.save_every < 1:
+        parser.error('num_epochs must be nonnegative; val_every and save_every must be positive')
+    if args.resume == 'latest':
+        args.resume = str(Path(args.save_dir) / 'latest.pt')
+    if args.resume:
+        PathDiffusionModel.checkpoint_config(torch.load(args.resume, map_location='cpu', weights_only=True))
     
     # Set device
     device = args.device if torch.cuda.is_available() else 'cpu'
@@ -405,7 +475,8 @@ def main():
     # Train
     trainer.train(
         num_epochs=args.num_epochs,
-        val_every=args.val_every
+        val_every=args.val_every,
+        save_every=args.save_every
     )
 
 
