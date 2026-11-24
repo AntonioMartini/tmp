@@ -15,7 +15,7 @@ from matplotlib.animation import FuncAnimation
 from tqdm import tqdm
 
 from data_preprocessing import PathDataset, prepare_datasets, denormalize_features
-from diffusion_model import PathDiffusionModel
+from diffusion_model import PathDiffusionModel, generate_constraint_mask
 
 
 class PathEvaluator:
@@ -120,12 +120,11 @@ class PathEvaluator:
         """
         Evaluate on a single batch.
         Metrics are computed over valid (non-padded) positions only.
-        The model is unconditional: the first and last valid point are
-        constrained to ground truth, matching the training task.
+        Targets are already normalized by PathDataset. Both endpoints and random
+        interior frames pin all four features, with a minimum 60-frame gap.
         """
-        # Normalize target
-        target_np = target.cpu().numpy()
-        target_norm = (target_np - self.norm_stats['mean']) / self.norm_stats['std']
+        # Use the target already normalized by the dataset
+        target_norm = target.cpu().numpy()
 
         # Convert to tensors
         target_tensor = torch.FloatTensor(target_norm).to(self.device)
@@ -133,11 +132,7 @@ class PathEvaluator:
         valid_lengths_np = actual_lengths.cpu().numpy()
 
         # Endpoint constraints: first and last valid point pinned to ground truth
-        B = target.shape[0]
-        constraint_mask = torch.zeros_like(attn_mask_tensor)
-        constraint_mask[:, 0] = 1
-        last_idx = (attention_mask.sum(dim=1).long() - 1).clamp(min=0)
-        constraint_mask[torch.arange(B, device=self.device), last_idx] = 1
+        constraint_mask = generate_constraint_mask(attn_mask_tensor)
 
         # Generate predictions
         samples = self.model.sample(
@@ -443,7 +438,7 @@ def main():
     parser.add_argument('--norm_stats', type=str, required=True, help='Path to normalization stats')
     parser.add_argument('--data_dir', type=str, default='./data', help='Data directory')
     parser.add_argument('--motion_data_dir', type=str, default='../motion_2/data', help='Motion data directory')
-    parser.add_argument('--min_prediction_length', type=int, default=20, help='Minimum prediction length (must match training)')
+    parser.add_argument('--min_prediction_length', type=int, default=120, help='Minimum prediction length (at least 61, must match training)')
     parser.add_argument('--max_prediction_length', type=int, default=600, help='Maximum prediction length (must match training)')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples for evaluation')
@@ -469,25 +464,10 @@ def main():
     
     # Load model
     print(f"Loading checkpoint from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    
-    max_seq_len = args.max_prediction_length
-    
-    model = PathDiffusionModel(
-        feature_dim=4,
-        num_timesteps=1000,
-        hidden_dim=256,
-        num_layers=6,
-        num_heads=8,
-        dropout=0.1,
-        pe_dropout=0.1,
-        norm_first=False,
-        max_seq_len=max_seq_len,
-        device=device
-    )
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    model = PathDiffusionModel.from_checkpoint(checkpoint, device=device)
+    if not 61 <= args.min_prediction_length <= args.max_prediction_length <= model.max_seq_len:
+        parser.error('Require 61 <= min_prediction_length <= max_prediction_length <= checkpoint max_seq_len')
     
     print(f"Model loaded successfully")
     print(f"Trained for {checkpoint['epoch']} epochs")
@@ -548,10 +528,8 @@ def main():
             context_denorm = target_denorm[:1]
 
             # Generate predictions: first and last valid point constrained to GT
-            target_norm = (target - norm_stats['mean']) / norm_stats['std']
-            constraint_mask = torch.zeros(1, target.shape[0], device=device)
-            constraint_mask[0, 0] = 1
-            constraint_mask[0, valid_len - 1] = 1
+            target_norm = target
+            constraint_mask = generate_constraint_mask(attention_mask)
             constraint_values = torch.FloatTensor(target_norm).unsqueeze(0).to(device)
 
             with torch.no_grad():

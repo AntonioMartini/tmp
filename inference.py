@@ -1,6 +1,6 @@
 """
 Inference script for path prediction diffusion model.
-The model is unconditional: the context only anchors generation through the
+The model is constraint-conditioned: context only anchors generation through the
 first-point constraint (first predicted point = last observed frame).
 """
 
@@ -14,8 +14,37 @@ import pickle
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-from diffusion_model import PathDiffusionModel
+from diffusion_model import (
+    PathDiffusionModel, generate_constraint_mask, validate_constraint_mask, MIN_CONSTRAINT_SPACING
+)
 from data_preprocessing import denormalize_features
+
+
+def build_constraints(anchor, prediction_length, constraint_mask=None, constraint_values=None):
+    if not isinstance(prediction_length, (int, np.integer)) or prediction_length <= MIN_CONSTRAINT_SPACING:
+        raise ValueError('prediction_length must be an integer of at least 61 frames')
+    anchor = np.asarray(anchor, dtype=np.float64)
+    if anchor.shape != (4,) or not np.isfinite(anchor).all():
+        raise ValueError('anchor must be a finite (4,) position and direction')
+    if constraint_values is None:
+        raise ValueError('constraint_values must provide the real waypoint values')
+    constraint_values = np.asarray(constraint_values, dtype=np.float64)
+    if constraint_values.shape != (prediction_length, 4) or not np.isfinite(constraint_values).all():
+        raise ValueError('constraint_values must be a finite (prediction_length, 4) array')
+    if constraint_mask is not None:
+        constraint_mask = np.asarray(constraint_mask)
+        if constraint_mask.shape != (prediction_length,) or not np.isin(constraint_mask, [0, 1]).all():
+            raise ValueError('constraint_mask must be a binary (prediction_length,) array')
+
+    attention = torch.ones(1, prediction_length)
+    mask = (generate_constraint_mask(attention)[0].numpy() if constraint_mask is None
+            else constraint_mask.astype(np.float32, copy=True))
+    mask[[0, -1]] = 1
+    validate_constraint_mask(torch.from_numpy(mask)[None], attention)
+    values = constraint_values.copy()
+    values[0] = anchor
+    values[mask == 0] = 0
+    return mask, values
 
 
 class PathPredictor:
@@ -25,7 +54,8 @@ class PathPredictor:
         self,
         checkpoint_path: str,
         norm_stats_path: str,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        max_seq_len: Optional[int] = None
     ):
         self.device = device if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {self.device}")
@@ -36,24 +66,12 @@ class PathPredictor:
         
         # Load model
         print(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         
-        # Create model (extract hyperparameters from checkpoint if available, otherwise use defaults)
-        model = PathDiffusionModel(
-            feature_dim=4,
-            num_timesteps=1000,
-            hidden_dim=256,
-            num_layers=6,
-            num_heads=8,
-            dropout=0.1,
-            pe_dropout=0.1,
-            norm_first=False,
-            device=self.device
-        )
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model = model.to(self.device)
-        model.eval()
+        # Create the mask-conditioned x0 model using the saved architecture and schedule
+        model = PathDiffusionModel.from_checkpoint(checkpoint, device=self.device)
+        if max_seq_len is not None and max_seq_len != model.max_seq_len:
+            raise ValueError('max_seq_len must match the checkpoint; omit it to use the saved value')
         
         self.model = model
         print(f"Model loaded successfully")
@@ -63,46 +81,56 @@ class PathPredictor:
     def predict(
         self,
         context: np.ndarray,
-        prediction_length: int = 60,
+        prediction_length: int = 120,
         num_samples: int = 5,
         clip_denoised: bool = True,
         max_prediction_length: int = None,
+        enforce_final_constraints: bool = True,
+        sampling_steps: int = None,
         constraint_mask: np.ndarray = None,
-        constraint_values: np.ndarray = None,
-        goal: np.ndarray = None
+        constraint_values: np.ndarray = None
     ) -> np.ndarray:
         """
         Generate path predictions.
 
-        The model is unconditional; the context only anchors generation via the
+        The model has no context encoder; context only anchors generation via the
         first-point constraint (first predicted point is pinned to the last
-        observed frame). The last predicted frame must always be constrained
-        too — either via `goal` or by constraining index `prediction_length - 1`
-        in `constraint_mask`.
+        observed frame). constraint_values supplies real target values for every
+        selected waypoint. Without an explicit mask, endpoints and random
+        interior frames are selected with at least 60 frames between constraints.
+        All four features are pinned.
 
         Args:
             context: (T_context, 4) context trajectory
             prediction_length: Number of frames to predict
             num_samples: Number of diverse predictions to generate
             clip_denoised: Whether to clip denoised predictions
-            max_prediction_length: Padded length the model was trained with
-                                   (if None, defaults to prediction_length)
-            constraint_mask: Optional (prediction_length,) mask, 1 at constrained
-                             positions. Index 0 is always constrained to the last
-                             context frame; additional indices are merged in.
-            constraint_values: Optional (prediction_length, 4) values at constrained
-                               positions, in the raw (unnormalized) frame.
-                               Required if constraint_mask constrains any index
-                               other than 0.
-            goal: Optional (4,) raw-frame value for the last predicted frame.
-                  Convenience wrapper for constraining index
-                  `prediction_length - 1`.
+            max_prediction_length: Padded sequence length to run the model at
+                                   (if None, defaults to prediction_length). May
+                                   exceed the training max_seq_len; the sinusoidal
+                                   positional encoding extends to any length.
+            constraint_mask: Optional binary (prediction_length,) mask. If absent,
+                             randomly select interior indices. Explicit masks are
+                             used as-is apart from always pinning both endpoints;
+                             all selected indices must be at least 60 frames apart.
+            constraint_values: Required raw (prediction_length, 4) reference path
+                               containing real waypoint values. Values at unselected
+                               frames are ignored. The first frame always uses
+                               context[-1].
 
         Returns:
             (num_samples, prediction_length, 4) predicted trajectories
         """
         if max_prediction_length is None:
             max_prediction_length = prediction_length
+        if not MIN_CONSTRAINT_SPACING < prediction_length <= max_prediction_length:
+            raise ValueError('Require 61 <= prediction_length <= max_prediction_length')
+        context = np.asarray(context)
+        if context.ndim != 2 or context.shape[1] != 4 or len(context) == 0:
+            raise ValueError('context must have shape (T_context, 4) with at least one frame')
+        raw_mask, raw_values = build_constraints(
+            context[-1], prediction_length, constraint_mask, constraint_values
+        )
 
         # Normalize context
         context_normalized = (context - self.norm_stats['mean']) / self.norm_stats['std']
@@ -114,31 +142,10 @@ class PathPredictor:
 
         # Build constraints in the normalized frame: index 0 pinned to the last
         # observed context frame; user constraints merged on top (raw frame).
-        mask = np.zeros(prediction_length)
-        mask[0] = 1
-        values = np.zeros((prediction_length, 4))
+        mask = raw_mask
+        values = (raw_values - self.norm_stats['mean']) / self.norm_stats['std']
+        values[mask == 0] = 0
         values[0] = context_normalized[-1]
-        if constraint_mask is not None:
-            user_mask = np.asarray(constraint_mask).astype(bool)
-            mask[user_mask] = 1
-            if constraint_values is not None:
-                values_norm = (np.asarray(constraint_values)
-                               - self.norm_stats['mean']) / self.norm_stats['std']
-                values[user_mask] = values_norm[user_mask]
-            elif user_mask[1:].any():
-                raise ValueError("constraint_values must be provided when "
-                                 "constraint_mask constrains positions beyond index 0")
-        if goal is not None:
-            mask[prediction_length - 1] = 1
-            values[prediction_length - 1] = (
-                (np.asarray(goal) - self.norm_stats['mean']) / self.norm_stats['std']
-            )
-        if mask[prediction_length - 1] != 1:
-            raise ValueError(
-                "The last predicted frame must be constrained (model is trained "
-                "with first/last always constrained): pass goal= or constrain "
-                "index prediction_length - 1 in constraint_mask"
-            )
 
         constraint_mask_padded = np.zeros(max_prediction_length)
         constraint_mask_padded[:prediction_length] = mask
@@ -155,7 +162,9 @@ class PathPredictor:
                 constraint_mask=constraint_mask_tensor,
                 constraint_values=constraint_values_tensor,
                 attention_mask=attention_mask,
-                device=self.device
+                device=self.device,
+                enforce_final_constraints=enforce_final_constraints,
+                sampling_steps=sampling_steps
             )
         
         # Trim padding, convert to numpy, denormalize
@@ -168,38 +177,55 @@ class PathPredictor:
         self,
         contexts: np.ndarray,
         prediction_lengths,
-        goals: np.ndarray,
+        constraint_values: np.ndarray,
         num_samples: int = 5,
         clip_denoised: bool = True,
         max_prediction_length: int = None
     ) -> list:
         """
-        Generate predictions for multiple contexts with per-context lengths.
+        Generate predictions with per-context lengths and random interior masks.
+        Waypoint values and directions are always taken from constraint_values.
 
         Args:
             contexts: (B, T_context, 4) context trajectories (anchors first point)
             prediction_lengths: (B,) array of prediction lengths, or a single int for all
-            goals: (B, 4) raw-frame values for each context's last predicted frame
+            constraint_values: Raw (B, max_prediction_length, 4) reference paths
+                               containing real waypoint values.
             num_samples: Number of diverse predictions per context
             clip_denoised: Whether to clip denoised predictions
-            max_prediction_length: Padded length the model was trained with
-                                   (if None, uses max of prediction_lengths)
+            max_prediction_length: Padded sequence length to run the model at
+                                   (if None, uses max of prediction_lengths). May
+                                   exceed the training max_seq_len; the sinusoidal
+                                   positional encoding extends to any length.
 
         Returns:
             List of B arrays, each (num_samples, pred_len_i, 4)
         """
+        contexts = np.asarray(contexts)
+        if contexts.ndim != 3 or contexts.shape[1] == 0 or contexts.shape[2] != 4:
+            raise ValueError('contexts must have shape (B, T_context, 4)')
         B = contexts.shape[0]
-        goals = np.asarray(goals)
-        assert goals.shape == (B, 4), f"goals must have shape ({B}, 4), got {goals.shape}"
-        
+        if B == 0:
+            raise ValueError('contexts must contain a nonempty batch')
+
         # Normalize prediction_lengths to a (B,) array
         if np.isscalar(prediction_lengths):
             prediction_lengths = np.full(B, prediction_lengths)
         else:
             prediction_lengths = np.asarray(prediction_lengths)
         
+        if prediction_lengths.shape != (B,) or not np.issubdtype(prediction_lengths.dtype, np.integer):
+            raise ValueError('prediction_lengths must contain one integer per context')
         if max_prediction_length is None:
             max_prediction_length = int(prediction_lengths.max())
+        if (prediction_lengths <= MIN_CONSTRAINT_SPACING).any() or (prediction_lengths > max_prediction_length).any():
+            raise ValueError('Require 61 <= each prediction_length <= max_prediction_length')
+        if constraint_values is None:
+            raise ValueError('constraint_values must provide the real waypoint values')
+        reference_values = np.asarray(constraint_values, dtype=np.float64)
+        if (reference_values.shape != (B, max_prediction_length, 4)
+                or not np.isfinite(reference_values).all()):
+            raise ValueError('constraint_values must be a finite (B, max_prediction_length, 4) array')
         
         # Normalize contexts
         contexts_normalized = (contexts - self.norm_stats['mean']) / self.norm_stats['std']
@@ -210,17 +236,18 @@ class PathPredictor:
             attention_masks[i, :int(pred_length)] = 1
         attention_masks = attention_masks.to(self.device)
 
-        # Endpoint constraints: first point pinned to the last observed frame,
-        # last valid point pinned to the given goal (normalized frame)
+        # Endpoint constraints use the context anchor and supplied waypoint values.
         constraint_masks = torch.zeros(B, max_prediction_length)
-        constraint_masks[:, 0] = 1
         constraint_values = torch.zeros(B, max_prediction_length, 4)
-        constraint_values[:, 0] = torch.FloatTensor(contexts_normalized[:, -1])
-        goals_norm = (goals - self.norm_stats['mean']) / self.norm_stats['std']
         for i, pred_length in enumerate(prediction_lengths):
-            last = int(pred_length) - 1
-            constraint_masks[i, last] = 1
-            constraint_values[i, last] = torch.FloatTensor(goals_norm[i])
+            length = int(pred_length)
+            reference = reference_values[i, :length]
+            mask, values = build_constraints(contexts[i, -1], length, constraint_values=reference)
+            normalized = (values - self.norm_stats['mean']) / self.norm_stats['std']
+            normalized[mask == 0] = 0
+            constraint_masks[i, :length] = torch.from_numpy(mask)
+            constraint_values[i, :length] = torch.from_numpy(normalized)
+        constraint_values[:, 0] = torch.FloatTensor(contexts_normalized[:, -1])
         constraint_masks = constraint_masks.to(self.device)
         constraint_values = constraint_values.to(self.device)
 
@@ -378,17 +405,22 @@ def main():
     parser.add_argument('--data_dir', type=str, default='./data', help='Data directory')
     parser.add_argument('--motion_data_dir', type=str, default='../motion_2/data', help='Motion data directory')
     parser.add_argument('--context_length', type=int, default=30, help='Context frames to load (anchors the first-point constraint)')
-    parser.add_argument('--prediction_length', type=int, default=60, help='Prediction sequence length')
+    parser.add_argument('--prediction_length', type=int, default=120, help='Prediction sequence length (at least 61)')
     parser.add_argument('--max_prediction_length', type=int, default=None, 
                         help='Maximum prediction length for variable-length model (pads shorter predictions)')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of diverse predictions')
-    parser.add_argument('--clip_name', type=str, default=None, help='Specific clip to use for context')
+    parser.add_argument('--clip_name', type=str, required=True,
+                        help='Clip supplying context and waypoint constraint values')
     parser.add_argument('--start_offset', type=int, default=0, help='Offset from clip start')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
     parser.add_argument('--output_dir', type=str, default='./predictions', help='Output directory')
     parser.add_argument('--visualize', action='store_true', help='Create visualization')
     
     args = parser.parse_args()
+    if args.prediction_length <= MIN_CONSTRAINT_SPACING:
+        parser.error('prediction_length must be at least 61')
+    if args.max_prediction_length is not None and args.max_prediction_length < args.prediction_length:
+        parser.error('max_prediction_length cannot be smaller than prediction_length')
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -401,26 +433,21 @@ def main():
         device=args.device
     )
     
-    # Load context (and goal = the true future endpoint, if using a clip)
-    if args.clip_name:
-        print(f"Loading context from clip: {args.clip_name}")
-        window = load_context_from_clip(
-            root_features_path=Path(args.data_dir) / 'root_feature_matrix.npy',
-            clip_ranges_path=Path(args.motion_data_dir) / 'clip_frame_ranges_world.pkl',
-            clip_name=args.clip_name,
-            context_length=args.context_length + args.prediction_length,
-            start_offset=args.start_offset
-        )
-        # Last frame of the window is the goal; the rest is context
-        goal = window[-1]
-        context = window[:args.context_length]
-    else:
-        # Random context; goal defaults to the last context frame
-        print("Loading random context...")
-        context = np.random.randn(args.context_length, 4)
-        goal = context[-1]
+    if not args.clip_name:
+        parser.error('--clip_name is required to supply real waypoint constraint values')
 
-    print(f"Context shape: {context.shape}, goal: {goal}")
+    print(f"Loading context from clip: {args.clip_name}")
+    window = load_context_from_clip(
+        root_features_path=Path(args.data_dir) / 'root_feature_matrix.npy',
+        clip_ranges_path=Path(args.motion_data_dir) / 'clip_frame_ranges_world.pkl',
+        clip_name=args.clip_name,
+        context_length=args.context_length + args.prediction_length - 1,
+        start_offset=args.start_offset
+    )
+    context = window[:args.context_length]
+    constraint_values = window[args.context_length - 1:]
+
+    print(f"Context shape: {context.shape}, waypoint values shape: {constraint_values.shape}")
 
     # Generate predictions
     print(f"Generating {args.num_samples} predictions...")
@@ -429,7 +456,7 @@ def main():
         prediction_length=args.prediction_length,
         num_samples=args.num_samples,
         max_prediction_length=args.max_prediction_length,
-        goal=goal
+        constraint_values=constraint_values
     )
     
     print(f"Predictions shape: {predictions.shape}")

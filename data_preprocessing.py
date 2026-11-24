@@ -12,6 +12,8 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
 
+from diffusion_model import MIN_CONSTRAINT_SPACING
+
 
 class PathDataset(Dataset):
     """Dataset of variable-length path sequences for an unconditional model.
@@ -26,7 +28,7 @@ class PathDataset(Dataset):
     def __init__(
         self,
         sequences: np.ndarray,
-        min_prediction_length: int = 20,
+        min_prediction_length: int = 120,
         max_prediction_length: int = 600
     ):
         """
@@ -35,14 +37,18 @@ class PathDataset(Dataset):
             min_prediction_length: Minimum sequence length per sample
             max_prediction_length: Maximum sequence length (padded tensor size)
         """
+        if not MIN_CONSTRAINT_SPACING < min_prediction_length <= max_prediction_length:
+            raise ValueError('Require 61 <= min_prediction_length <= max_prediction_length')
         self.sequences = sequences
         self.min_prediction_length = min_prediction_length
         self.max_prediction_length = max_prediction_length
 
         self.valid_indices = [
             i for i, seq in enumerate(sequences)
-            if len(seq) >= 1
+            if len(seq) > MIN_CONSTRAINT_SPACING
         ]
+        if not self.valid_indices:
+            raise ValueError('No trajectories with at least 61 frames are available')
 
     def __len__(self):
         return len(self.valid_indices)
@@ -125,46 +131,64 @@ def extract_sequences_from_clips(
     return np.array(sequences, dtype=object)
 
 
+def compute_norm_stats(features: np.ndarray, method: str = 'standard') -> dict:
+    """Normalization statistics over all rows of a feature array."""
+    features = features.reshape(-1, 4)
+    if method == 'standard':
+        mean = features.mean(axis=0)
+        std = features.std(axis=0)
+        std[std == 0] = 1.0  # Avoid division by zero
+        stats = {'mean': mean, 'std': std, 'method': 'standard'}
+    elif method == 'minmax':
+        min_val = features.min(axis=0)
+        max_val = features.max(axis=0)
+        range_val = max_val - min_val
+        range_val[range_val == 0] = 1.0
+        stats = {'min': min_val, 'max': max_val, 'method': 'minmax'}
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+    return stats
+
+
+def normalize_with_stats(sequences: np.ndarray, stats: dict) -> np.ndarray:
+    """Normalize sequences with precomputed statistics.
+
+    Variable-length sequences keep their true lengths: padding is only added
+    later (by PathDataset) as literal zeros, never normalized.
+    """
+    if stats['method'] == 'standard':
+        loc, scale = stats['mean'], stats['std']
+    elif stats['method'] == 'minmax':
+        loc, scale = stats['min'], stats['max'] - stats['min']
+    else:
+        raise ValueError(f"Unknown normalization method: {stats['method']}")
+
+    if isinstance(sequences, np.ndarray) and sequences.dtype != object:
+        return (sequences - loc) / scale
+    normalized = np.empty(len(sequences), dtype=object)
+    for i, seq in enumerate(sequences):
+        normalized[i] = (seq - loc) / scale
+    return normalized
+
+
 def normalize_features(sequences: np.ndarray, method: 'standard') -> Tuple[np.ndarray, dict]:
     """
     Normalize path features.
-    
+
     Args:
-        sequences: Array of shape (M, T, 4) containing sequences
+        sequences: Array of shape (M, T, 4) containing sequences,
+                   or a list/object array of variable-length (T_i, 4) sequences
         method: Normalization method ('standard' or 'minmax')
-        
+
     Returns:
         Normalized sequences and normalization statistics
     """
-    # First convert to regular numpy array if it's object dtype
-    if sequences.dtype == object:
-        max_len = max(len(seq) for seq in sequences)
-        padded = np.zeros((len(sequences), max_len, 4))
-        for i, seq in enumerate(sequences):
-            padded[i, :len(seq)] = seq
-        sequences = padded
-    
-    # Flatten to compute statistics
-    all_features = sequences.reshape(-1, 4)
-    
-    if method == 'standard':
-        mean = all_features.mean(axis=0)
-        std = all_features.std(axis=0)
-        std[std == 0] = 1.0  # Avoid division by zero
-        
-        normalized = (sequences - mean) / std
-        stats = {'mean': mean, 'std': std, 'method': 'standard'}
-        
-    elif method == 'minmax':
-        min_val = all_features.min(axis=0)
-        max_val = all_features.max(axis=0)
-        range_val = max_val - min_val
-        range_val[range_val == 0] = 1.0
-        
-        normalized = (sequences - min_val) / range_val
-        stats = {'min': min_val, 'max': max_val, 'method': 'minmax'}
-    
-    return normalized, stats
+    if isinstance(sequences, np.ndarray) and sequences.dtype != object:
+        features = sequences
+    else:
+        features = np.concatenate([np.asarray(seq) for seq in sequences], axis=0)
+    stats = compute_norm_stats(features, method=method)
+    return normalize_with_stats(sequences, stats), stats
 
 
 def denormalize_features(normalized: np.ndarray, stats: dict) -> np.ndarray:
@@ -180,7 +204,7 @@ def denormalize_features(normalized: np.ndarray, stats: dict) -> np.ndarray:
 def prepare_datasets(
     root_features_path: Path,
     clip_ranges_path: Path,
-    min_prediction_length: int = 20,
+    min_prediction_length: int = 120,
     max_prediction_length: int = 600,
     batch_size: int = 32,
     test_split: float = 0.2,
@@ -197,7 +221,7 @@ def prepare_datasets(
         max_prediction_length: Maximum prediction length (padded tensor size)
         batch_size: Batch size for dataloaders
         test_split: Fraction of data for testing
-        val_split: Fraction of training data for validation
+        val_split: Fraction of all data for validation
         random_seed: Random seed for reproducibility
         
     Returns:
@@ -225,10 +249,11 @@ def prepare_datasets(
     )
     print(f"Extracted {len(sequences)} sequences")
     
-    # Normalize
+    # Normalize: statistics over the raw feature matrix, applied per sequence
     print("Normalizing features...")
-    sequences, norm_stats = normalize_features(sequences, method='standard')
-    print(f"Normalized sequences shape: {sequences.shape}")
+    norm_stats = compute_norm_stats(root_features)
+    sequences = normalize_with_stats(sequences, norm_stats)
+    print(f"Normalized {len(sequences)} sequences")
     
     # Train/val/test split
     print("Splitting data...")
@@ -236,7 +261,7 @@ def prepare_datasets(
         sequences, test_size=test_split, random_state=random_seed
     )
     train_sequences, val_sequences = train_test_split(
-        train_val_sequences, test_size=val_split, random_state=random_seed
+        train_val_sequences, test_size=val_split / (1.0 - test_split), random_state=random_seed
     )
     
     print(f"Train sequences: {len(train_sequences)}")
@@ -279,8 +304,8 @@ if __name__ == '__main__':
     train_loader, val_loader, test_loader, norm_stats = prepare_datasets(
         root_features_path=data_dir / 'root_feature_matrix.npy',
         clip_ranges_path=motion_data_dir / 'clip_frame_ranges_world.pkl',
-        min_prediction_length=20,
-        max_prediction_length=60,
+        min_prediction_length=120,
+        max_prediction_length=180,
         batch_size=16
     )
 

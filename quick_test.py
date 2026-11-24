@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 
 from data_preprocessing import prepare_datasets
-from diffusion_model import PathDiffusionModel
+from diffusion_model import PathDiffusionModel, generate_constraint_mask
 
 def test_pipeline():
     """Test the complete pipeline with a small model."""
@@ -22,8 +22,8 @@ def test_pipeline():
     train_loader, val_loader, test_loader, norm_stats = prepare_datasets(
         root_features_path=Path('./data/root_feature_matrix.npy'),
         clip_ranges_path=Path('../motion_2/data/clip_frame_ranges_world.pkl'),
-        min_prediction_length=15,
-        max_prediction_length=20,
+        min_prediction_length=120,
+        max_prediction_length=180,
         batch_size=4
     )
     
@@ -58,20 +58,17 @@ def test_pipeline():
     timesteps = torch.randint(0, 50, (target.shape[0],), device=device)
 
     # Forward pass
-    noise_pred = model(target, timesteps, attention_mask=attention_mask)
-    print(f"Noise prediction shape: {noise_pred.shape}")
+    clean_pred = model(target, timesteps, attention_mask=attention_mask)
+    print(f"Clean prediction shape: {clean_pred.shape}")
 
     # Test sampling (first point constrained to the target's first point,
     # which also anchors the canonicalization frame)
     print("\n4. Testing sampling...")
     model.eval()
-    constraint_mask = torch.zeros_like(attention_mask)
-    constraint_mask[:, 0] = 1
-    last_idx = (attention_mask.sum(dim=1).long() - 1).clamp(min=0)
-    constraint_mask[torch.arange(target.shape[0], device=device), last_idx] = 1
+    constraint_mask = generate_constraint_mask(attention_mask)
     with torch.no_grad():
         samples = model.sample(
-            prediction_length=20,
+            prediction_length=180,
             num_samples=2,
             constraint_mask=constraint_mask,
             constraint_values=target,

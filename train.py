@@ -84,6 +84,9 @@ class DiffusionTrainer:
         weight_decay: float = 1e-6,
         ema_decay: float = 0.995,
         ema_interval: int = 10,
+        lr_schedule: str = 'constant',
+        lr_start: float = 1e-4,
+        lr_end: float = 2e-5,
         save_dir: str = './checkpoints_kimodo'
     ):
         self.model = model
@@ -106,10 +109,16 @@ class DiffusionTrainer:
         self.writer = SummaryWriter(log_dir=log_root / f'run_{run_num:03d}')
         print(f"TensorBoard run: run_{run_num:03d}")
 
-        # Optimizer: Adam-atan2 with constant LR (Kimodo recipe, no scheduler)
+        # Optimizer: Adam-atan2, constant LR by default (Kimodo recipe) or
+        # annealed after each epoch by a cosine schedule from lr_start to lr_end
+        if lr_schedule not in ('constant', 'cosine'):
+            raise ValueError(f"Unknown lr_schedule: {lr_schedule}")
+        self.lr_schedule = lr_schedule
+        self.lr_start = lr_start
+        self.lr_end = lr_end
         self.optimizer = AdamAtan2(
             model.parameters(),
-            lr=learning_rate,
+            lr=lr_start if lr_schedule == 'cosine' else learning_rate,
             weight_decay=weight_decay
         )
 
@@ -196,6 +205,15 @@ class DiffusionTrainer:
             self.ema_params[name].mul_(self.ema_decay).add_(
                 p.detach(), alpha=1 - self.ema_decay
             )
+
+    def _epoch_lr(self, epoch: int, num_epochs: int) -> float:
+        """Cosine learning rate for a 0-indexed epoch: lr_start at epoch 0, lr_end at the last."""
+        progress = epoch / max(1, num_epochs - 1)
+        return self.lr_end + (self.lr_start - self.lr_end) * (1 + math.cos(math.pi * progress)) / 2
+
+    def _set_lr(self, lr: float):
+        for group in self.optimizer.param_groups:
+            group['lr'] = lr
 
     def train_epoch(self) -> float:
         """Train for one epoch."""
@@ -296,34 +314,31 @@ class DiffusionTrainer:
         if PathDiffusionModel.checkpoint_config(checkpoint) != self.model.config:
             raise ValueError('Resume model configuration must match the saved model_config')
         
+        required = {'raw_model_state_dict', 'ema_state_dict', 'optimizer_state_dict',
+                    'next_epoch', 'global_step', 'best_val_loss', 'ema_decay', 'ema_interval',
+                    'torch_rng_state', 'numpy_rng_state', 'python_rng_state', 'cuda_rng_state'}
+        missing = required - checkpoint.keys()
+        if missing:
+            raise ValueError(f'Checkpoint is missing required fields: {sorted(missing)}')
+
         # Prefer raw training weights over the EMA inference weights when resuming
-        self.model.load_state_dict(
-            checkpoint.get('raw_model_state_dict', checkpoint['model_state_dict'])
-        )
-        if 'ema_state_dict' in checkpoint:
-            self.ema_params = {
-                k: v.to(self.device) for k, v in checkpoint['ema_state_dict'].items()
-            }
-        else:
-            self.ema_params = {
-                name: p.detach().clone() for name, p in self.model.named_parameters()
-            }
+        self.model.load_state_dict(checkpoint['raw_model_state_dict'])
+        self.ema_params = {
+            k: v.to(self.device) for k, v in checkpoint['ema_state_dict'].items()
+        }
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.next_epoch = checkpoint.get('next_epoch', checkpoint['epoch'] + 1)
+        self.next_epoch = checkpoint['next_epoch']
         self.current_epoch = self.next_epoch
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
         self.best_ema_snapshot = None
-        self.ema_decay = checkpoint.get('ema_decay', self.ema_decay)
-        self.ema_interval = checkpoint.get('ema_interval', self.ema_interval)
-        if 'torch_rng_state' in checkpoint:
-            torch.set_rng_state(checkpoint['torch_rng_state'].cpu())
-        if 'numpy_rng_state' in checkpoint:
-            name, keys, position, has_gauss, cached = checkpoint['numpy_rng_state']
-            np.random.set_state((name, np.asarray(keys, dtype=np.uint32), position, has_gauss, cached))
-        if 'python_rng_state' in checkpoint:
-            random.setstate(checkpoint['python_rng_state'])
-        cuda_rng = checkpoint.get('cuda_rng_state', [])
+        self.ema_decay = checkpoint['ema_decay']
+        self.ema_interval = checkpoint['ema_interval']
+        torch.set_rng_state(checkpoint['torch_rng_state'].cpu())
+        name, keys, position, has_gauss, cached = checkpoint['numpy_rng_state']
+        np.random.set_state((name, np.asarray(keys, dtype=np.uint32), position, has_gauss, cached))
+        random.setstate(checkpoint['python_rng_state'])
+        cuda_rng = checkpoint['cuda_rng_state']
         if cuda_rng and torch.cuda.is_available():
             if len(cuda_rng) == torch.cuda.device_count():
                 torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng])
@@ -340,12 +355,18 @@ class DiffusionTrainer:
         print(f"Training to {num_epochs} total epochs ({self.next_epoch} already completed)")
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"Optimizer: Adam-atan2, constant lr = {self.optimizer.param_groups[0]['lr']}")
+        if self.lr_schedule == 'cosine':
+            print(f"Optimizer: Adam-atan2, cosine lr {self.lr_start:.2e} -> {self.lr_end:.2e} over {num_epochs} epochs")
+        else:
+            print(f"Optimizer: Adam-atan2, constant lr = {self.optimizer.param_groups[0]['lr']}")
         print(f"EMA: decay = {self.ema_decay}, every {self.ema_interval} steps")
         
         for epoch in range(self.next_epoch, num_epochs):
             self.current_epoch = epoch
-            
+
+            if self.lr_schedule == 'cosine':
+                self._set_lr(self._epoch_lr(epoch, num_epochs))
+
             # Train
             train_loss = self.train_epoch()
             self.next_epoch = epoch + 1
@@ -395,16 +416,21 @@ def main():
     parser.add_argument('--motion_data_dir', type=str, default='../motion_2/data', help='Motion data directory')
     parser.add_argument('--min_prediction_length', type=int, default=120, help='Minimum prediction length (at least 61)')
     parser.add_argument('--max_prediction_length', type=int, default=600, help='Maximum prediction length (padded tensor size)')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=512, help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=100, help='Total target epochs, including epochs already completed on resume')
     parser.add_argument('--learning_rate', type=float, default=2e-5, help='Learning rate')
-    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
+    parser.add_argument('--lr_schedule', type=str, default='constant', choices=['constant', 'cosine'],
+                        help='Learning rate schedule; cosine anneals after each epoch from lr_start to lr_end')
+    parser.add_argument('--lr_start', type=float, default=1e-4, help='Learning rate at the first epoch (cosine schedule)')
+    parser.add_argument('--lr_end', type=float, default=2e-5, help='Learning rate at the last epoch (cosine schedule)')
+    parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=6, help='Number of transformer layers')
     parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+    parser.add_argument('--ff_size', type=int, default=None, help='Transformer feedforward dimension (default: 2x hidden_dim)')
+    parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
     parser.add_argument('--num_timesteps', type=int, default=1000, help='Number of diffusion timesteps')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints_kimodo', help='Checkpoint directory')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Checkpoint directory')
     parser.add_argument('--resume', type=str, default=None, help='Checkpoint path, or latest to load <save_dir>/latest.pt')
     parser.add_argument('--val_every', type=int, default=1, help='Validate every N epochs')
     parser.add_argument('--save_every', type=int, default=50, help='Save a numbered checkpoint every N completed epochs')
@@ -414,6 +440,8 @@ def main():
         parser.error('Require 61 <= min_prediction_length <= max_prediction_length')
     if args.num_epochs < 0 or args.val_every < 1 or args.save_every < 1:
         parser.error('num_epochs must be nonnegative; val_every and save_every must be positive')
+    if args.lr_start <= 0 or args.lr_end <= 0:
+        parser.error('lr_start and lr_end must be positive')
     if args.resume == 'latest':
         args.resume = str(Path(args.save_dir) / 'latest.pt')
     if args.resume:
@@ -449,6 +477,7 @@ def main():
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
+        ff_size=args.ff_size,
         dropout=args.dropout,
         pe_dropout=args.dropout,
         norm_first=False,
@@ -465,6 +494,9 @@ def main():
         val_loader=val_loader,
         device=device,
         learning_rate=args.learning_rate,
+        lr_schedule=args.lr_schedule,
+        lr_start=args.lr_start,
+        lr_end=args.lr_end,
         save_dir=args.save_dir
     )
     

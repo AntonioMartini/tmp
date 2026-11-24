@@ -89,7 +89,7 @@ sequenceDiagram
     Model->>Denoiser: noisy_target, context, t
     
     Denoiser->>Denoiser: Project noisy path
-    Denoiser->>Denoiser: Embed & broadcast timestep
+    Denoiser->>Denoiser: Embed timestep as prefix token
     Denoiser->>Denoiser: Add positional encoding
     Denoiser->>Denoiser: Transformer encoder
     Denoiser->>Denoiser: Project to noise
@@ -245,7 +245,7 @@ noise_pred
   - Multi-head attention mechanism parameter
   - Must divide hidden_dim evenly
   - Typical range: 4-16
-- `--dropout`: Dropout rate for regularization (default: `0.1`)
+- `--dropout`: Dropout rate for regularization (default: `0.0`)
   - Probability of dropping units during training
   - Helps prevent overfitting
   - Typical range: 0.0-0.3
@@ -534,9 +534,10 @@ model = PathDiffusionModel(
     hidden_dim = 256,                   # Model capacity (128-512 typical)
     num_layers = 6,                     # Transformer depth (4-12 typical)
     num_heads = 8,                      # Attention heads (must divide hidden_dim)
+    ff_size = 512,                      # Feedforward dim (default: 2x hidden_dim, Kimodo ratio)
     num_timesteps = 1000,               # Diffusion steps (100-1000 typical)
-    dropout = 0.1,                      # Regularization (0.0-0.3 typical)
-    pe_dropout = 0.1,                   # Positional encoding dropout
+    dropout = 0.0,                      # Regularization (0.0-0.3 typical)
+    pe_dropout = 0.0,                   # Positional encoding dropout
     norm_first = False,                # Post-norm architecture
     beta_schedule = 'linear',           # Noise schedule type
     device = 'cuda'                     # Training device
@@ -679,8 +680,8 @@ FUNCTION compute_training_loss(model, batch, diffusion):
     noise_pred = model(noisy_target, context, timesteps)
     # Implementation:
     # - Project noisy_path: (B, T_pred, 4) -> (B, T_pred, hidden_dim)
-    # - Embed timestep: (B,) -> (B, 1, hidden_dim) -> (B, T_pred, hidden_dim)
-    # - Add timestep embedding to projected path
+    # - Embed timestep: (B,) -> (B, 1, hidden_dim)
+    # - Prepend timestep token to projected path
     # - Add positional encoding
     # - Pass through transformer encoder
     # - Project back: (B, T_pred, hidden_dim) -> (B, T_pred, 4)
@@ -730,26 +731,27 @@ FUNCTION path_denoiser_forward(noisy_path, context, timestep, attention_mask=Non
     time_embedding = mlp(time_embedding)  # (B, hidden_dim) -> (B, hidden_dim)
     time_embedding = time_embedding.unsqueeze(1)  # (B, 1, hidden_dim)
     
-    # Step 3: Broadcast timestep embedding across sequence (Kimodo-style)
-    time_embedding = time_embedding.expand(-1, T_pred, -1)  # (B, T_pred, hidden_dim)
+    # Step 3: Prepend timestep embedding as a prefix token (Kimodo-style)
+    x = concat([time_embedding, noisy_proj], dim=1)  # (B, 1 + T_pred, hidden_dim)
     
-    # Step 4: Add timestep embedding to projected path
-    x = noisy_proj + time_embedding  # (B, T_pred, hidden_dim)
-    
-    # Step 5: Add sinusoidal positional encoding
-    x = x + positional_encoding[:T_pred, :]  # (B, T_pred, hidden_dim)
+    # Step 4: Add sinusoidal positional encoding
+    x = x + positional_encoding[:1 + T_pred, :]  # (B, 1 + T_pred, hidden_dim)
     x = dropout(x, p = pe_dropout)
     
-    # Step 6: Convert attention mask to transformer key_padding_mask
+    # Step 5: Convert attention mask to transformer key_padding_mask
     # attention_mask: 1=valid, 0=padding -> key_padding_mask: True=ignore
+    # The timestep prefix token is always valid (never masked)
     if attention_mask is not None:
-        key_padding_mask = (attention_mask == 0)
+        key_padding_mask = concat([zeros(B, 1), (attention_mask == 0)], dim=1)
     else:
         key_padding_mask = None
     
-    # Step 7: Pass through transformer encoder (num_layers)
+    # Step 6: Pass through transformer encoder (num_layers)
     # key_padding_mask prevents attending to padded positions
     x = transformer_encoder(x, src_key_padding_mask=key_padding_mask)
+    
+    # Step 7: Slice off the timestep prefix token
+    x = x[:, 1:]  # (B, T_pred, hidden_dim)
     
     # Step 8: Project back to feature dimension
     noise_pred = output_linear(x)  # (B, T_pred, hidden_dim) -> (B, T_pred, 4)

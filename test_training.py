@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 from train import DiffusionTrainer
 from data_preprocessing import prepare_datasets
-from diffusion_model import PathDiffusionModel
+from diffusion_model import PathDiffusionModel, MODEL_FORMAT_VERSION
 
 def test_training():
     """Test training for a few iterations."""
@@ -91,7 +91,7 @@ def test_kimodo_checkpoint_round_trip(tmp_path):
     checkpoint_path = tmp_path / 'best_model.pt'
     stats_path = tmp_path / 'normalization_stats.npy'
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
-    assert checkpoint['format_version'] == 2
+    assert checkpoint['format_version'] == MODEL_FORMAT_VERSION
     assert checkpoint['prediction_type'] == 'x0'
     assert checkpoint['constraint_conditioning'] == 'clean_imputation_mask'
     predictor = PathPredictor(str(checkpoint_path), str(stats_path), device='cpu')
@@ -101,10 +101,11 @@ def test_kimodo_checkpoint_round_trip(tmp_path):
     for name, param in predictor.model.named_parameters():
         torch.testing.assert_close(param, checkpoint['model_state_dict'][name])
     anchor = np.array([10., -20., 1., 0.])
-    goal = np.array([110., 60., 0., 1.])
-    mask, values = build_constraints(anchor, 181, goal)
+    values = np.tile([40., 25., 0., 1.], (181, 1))
+    values[-1] = [110., 60., 0., 1.]
+    mask, values = build_constraints(anchor, 181, constraint_values=values)
     predictions = predictor.predict(anchor[None], 181, num_samples=2, max_prediction_length=600,
-                                    constraint_mask=mask, constraint_values=values, goal=goal)
+                                    constraint_mask=mask, constraint_values=values)
     assert np.isfinite(predictions).all()
     for prediction in predictions:
         np.testing.assert_allclose(prediction[mask.astype(bool)], values[mask.astype(bool)], atol=2e-5)
@@ -145,7 +146,7 @@ def test_kimodo_notebook(tmp_path):
     project_dir = Path(__file__).resolve().parent
     notebook = nbformat.read(project_dir / 'test_random_constraints.ipynb', as_version=4)
     nbformat.validate(notebook)
-    original = "CHECKPOINT_DIR = PROJECT_DIR / 'checkpoints_kimodo'"
+    original = "CHECKPOINT_DIR = PROJECT_DIR / 'checkpoints'"
     assert original in notebook.cells[1].source
     notebook.cells[1].source = notebook.cells[1].source.replace(original, f'CHECKPOINT_DIR = Path({str(tmp_path)!r})')
     executed = nbclient.NotebookClient(notebook, timeout=120, kernel_name='python3',
@@ -190,6 +191,31 @@ def test_periodic_and_final_checkpoints(tmp_path):
     assert latest['best_val_loss'] == best['best_val_loss'] == .5
 
 
+def test_cosine_lr_schedule(tmp_path):
+    from unittest.mock import patch
+
+    model = PathDiffusionModel(hidden_dim=16, num_layers=1, num_heads=2,
+                               num_timesteps=4, max_seq_len=121, device='cpu')
+    trainer = DiffusionTrainer(model, [], [], device='cpu', save_dir=tmp_path,
+                               lr_schedule='cosine', lr_start=1e-4, lr_end=2e-5)
+    lrs = []
+
+    def train_epoch():
+        lrs.append(trainer.optimizer.param_groups[0]['lr'])
+        return 1.0
+
+    with patch.object(trainer, 'train_epoch', side_effect=train_epoch), \
+            patch.object(trainer, 'validate', return_value=float('inf')):
+        trainer.train(5)
+    np.testing.assert_allclose(lrs[0], 1e-4)
+    np.testing.assert_allclose(lrs[-1], 2e-5)
+    assert all(a > b for a, b in zip(lrs, lrs[1:]))
+
+    with np.testing.assert_raises_regex(ValueError, 'Unknown lr_schedule'):
+        DiffusionTrainer(model, [], [], device='cpu', save_dir=tmp_path,
+                         lr_schedule='linear')
+
+
 def test_resume_starts_after_saved_epoch(tmp_path):
     from unittest.mock import patch
 
@@ -224,9 +250,8 @@ def test_resume_starts_after_saved_epoch(tmp_path):
     older = torch.load(tmp_path / 'epoch_0050.pt', weights_only=True)
     del older['next_epoch']
     torch.save(older, tmp_path / 'older_kimodo.pt')
-    resumed.load_checkpoint(tmp_path / 'older_kimodo.pt')
-    assert resumed.next_epoch == 50
-    assert resumed.current_epoch == 50
+    with np.testing.assert_raises_regex(ValueError, 'missing required fields'):
+        resumed.load_checkpoint(tmp_path / 'older_kimodo.pt')
 
 
 def test_resume_restores_rng_and_ema_settings(tmp_path):

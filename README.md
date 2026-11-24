@@ -117,10 +117,14 @@ Arguments (defaults match the command above):
 - `--batch_size`: Batch size (default: 32)
 - `--num_epochs`: Total target epochs (default: 100)
 - `--learning_rate`: Constant Adam-atan2 learning rate (default: 2e-5)
+- `--lr_schedule`: `constant` (default) or `cosine`; cosine anneals the learning rate after each epoch
+- `--lr_start`: Learning rate at the first epoch with `--lr_schedule cosine` (default: 1e-4)
+- `--lr_end`: Learning rate at the last epoch with `--lr_schedule cosine` (default: 2e-5)
 - `--hidden_dim`: Model hidden dimension (default: 256)
 - `--num_layers`: Number of transformer layers (default: 6)
 - `--num_heads`: Number of attention heads (default: 8)
-- `--dropout`: Dropout for the transformer layers and positional encoding (default: 0.1)
+- `--ff_size`: Transformer feedforward dimension (default: 2x hidden_dim = 512, matching Kimodo's 2048/1024 ratio)
+- `--dropout`: Dropout for the transformer layers and positional encoding (default: 0.0, disabled)
 - `--num_timesteps`: Diffusion timesteps (default: 1000)
 - `--device`: `cuda` or `cpu` (default: `cuda`, falls back to CPU if unavailable)
 - `--save_dir`: Directory for checkpoints and normalization stats (default: `./checkpoints_kimodo`, created if missing)
@@ -138,7 +142,7 @@ Checkpointing:
 - Checkpoints record the completed epoch count, `global_step`, optimizer state, EMA settings, and Python/NumPy/PyTorch RNG state; resuming continues at the **next** epoch (a checkpoint with `next_epoch=50` resumes at epoch 51) rather than repeating the saved epoch
 - Writes are atomic (temporary file + rename), so a failed save never corrupts the previous `latest.pt`
 - `normalization_stats.npy` is written to `--save_dir` at startup and is required at inference time
-- New checkpoints store `format_version=2`, `prediction_type='x0'`, `constraint_conditioning='clean_imputation_mask'`, and the complete model architecture/noise-schedule configuration. Inference and evaluation restore these settings instead of hardcoding them.
+- New checkpoints store `format_version=3`, `prediction_type='x0'`, `constraint_conditioning='clean_imputation_mask'`, and the complete model architecture/noise-schedule configuration. Inference and evaluation restore these settings instead of hardcoding them.
 - **Retraining is required:** old 4-input noise-prediction checkpoints are rejected by inference, evaluation, and training resume. The new input projection has 8 features and a different prediction objective. Use a new run without `--resume`; the default output directory is now `./checkpoints_kimodo` to preserve existing weights.
 - Resuming a new-format checkpoint requires matching model hyperparameters. The new L1 validation losses are not comparable to the old noise MSE values.
 
@@ -148,7 +152,7 @@ Monitoring:
 
 How it works:
 - Clips shorter than `--min_prediction_length` are skipped; clips longer than 700 frames are first split into near-equal chunks
-- Sequences are z-score normalized over all extracted sequences, then split 80/20 into train+val vs. test, with 10% of the remainder going to validation (~72/8/20), using seed 42
+- Sequences are z-score normalized over all extracted sequences, then split 80/20 into train+val vs. test, with validation taking 10% of all data (~70/10/20), using seed 42
 - Each training sample gets a random sequence length in `[min, max]`, clamped to the frames available in the clip (set both equal for fixed-length)
 - Shorter targets are **zero-padded** to `max_prediction_length`
 - An `attention_mask` prevents the transformer from attending to padding
@@ -189,13 +193,13 @@ Key arguments:
 - `--prediction_length`: Number of frames to predict (default: 120; at least 61 and no greater than the trained max)
 - `--max_prediction_length`: Maximum length the model was trained with (default: `--prediction_length`). Shorter predictions are generated via internal padding, then trimmed.
 
-`PathPredictor.predict()` accepts a raw `constraint_values` array `(prediction_length, 4)` and an optional binary `constraint_mask` `(prediction_length,)`. Without a mask it generates random interior entries plus both endpoints. With a mask it uses your selections, always pins frame 0 to `context[-1]`, and pins the last frame to `goal` (or the supplied last reference value). Explicit interior constraints require values; conflicting frame-0 values cannot override the context anchor. Every selected frame pins both position and direction.
+`PathPredictor.predict()` requires a raw `constraint_values` array `(prediction_length, 4)` containing real target waypoint values, plus an optional binary `constraint_mask` `(prediction_length,)`. Without a mask it selects random interior entries plus both endpoints; with a mask it uses your selections. Frame 0 always uses `context[-1]`, so a conflicting first reference value cannot override the context anchor. Every selected frame pins both position and direction.
 
-If no interior values are provided, inference uses linearly interpolated endpoint positions and shortest-arc unit headings at the random indices. Providing a reference trajectory instead uses its actual values at those indices. `predict_batch()` supports the same randomized behavior with optional raw reference paths shaped `(B, max_prediction_length, 4)`. To inspect or visualize a mask before inference, call `inference.build_constraints()` and pass its returned mask and values to `predict()`.
+`predict_batch()` likewise requires raw reference paths shaped `(B, max_prediction_length, 4)` containing real target values. Values at unselected frames are ignored. To inspect or visualize a mask before inference, call `inference.build_constraints()` with the reference values and pass its returned mask and values to `predict()`.
 
-The CLI samples interior constraints from the selected clip's actual future trajectory when `--clip_name` is given. With no clip it uses endpoint interpolation. This is constrained reconstruction when a reference future is supplied, not unconstrained forecasting.
+The CLI requires `--clip_name` and uses the selected clip's future trajectory as its waypoint reference. This is constrained reconstruction when a reference future is supplied, not unconstrained forecasting.
 
-`model.sample()` takes batched, normalized `constraint_mask` `(B, T)` and `constraint_values` `(B, T, 4)`. If the mask is omitted, supply a full reference path so every randomly selected frame has a meaningful value. Explicit masks must include both valid endpoints and obey the 60-frame minimum spacing. The first constrained point anchors canonicalization. `PathPredictor` restores the saved maximum sequence length and diffusion-step count automatically. An optional `max_seq_len` argument must match the checkpoint.
+`model.sample()` takes batched, normalized `constraint_mask` `(B, T)` and `constraint_values` `(B, T, 4)`. Explicit masks must include both valid endpoints and obey the 60-frame minimum spacing. The first constrained point anchors canonicalization. `PathPredictor` restores the saved maximum sequence length and diffusion-step count automatically. An optional `max_seq_len` argument must match the checkpoint.
 
 Random mask generation uses PyTorch's RNG; use `torch.manual_seed(seed)` to reproduce it. The test notebook also seeds its NumPy generator for reproducible synthetic waypoint values.
 
@@ -239,15 +243,15 @@ Default hyperparameters (as defined in `train.py` and `diffusion_model.py`):
 - Trajectory/output dimension: 4 (x, z, forward_x, forward_z); denoiser input dimension: 8 (imputed trajectory + feature mask)
 - Prediction objective: clean trajectory (`x0`), masked L1 reconstruction loss over valid frames
 - Sequence length: variable, 120-600 by default (zero-padded to `max_prediction_length`; minimum supported length is 61)
-- Hidden dimension: 256; feedforward dimension: 1024 (4x hidden)
+- Hidden dimension: 256; feedforward dimension: 512 (2x hidden, matching Kimodo's `ff_size`/`latent_dim` ratio)
 - Transformer layers: 6, post-norm (`norm_first=False`), GELU activation
 - Attention heads: 8
-- Dropout: 0.1 (transformer layers and positional encoding)
-- Positional encoding: sinusoidal, non-learned; timestep embedding uses a separate sinusoidal table (sized to `num_timesteps`) plus a 2-layer SiLU MLP, broadcast to every position
+- Dropout: 0.0 (disabled in transformer layers and positional encoding; Kimodo removes dropout once constraint conditioning is active)
+- Positional encoding: sinusoidal, non-learned; timestep embedding uses a separate sinusoidal table (sized to `num_timesteps`) plus a 2-layer SiLU MLP, prepended as a prefix token that pose tokens read through self-attention
 - Diffusion timesteps: 1000
 - Noise schedule: linear betas from 1e-4 to 0.02 (`beta_schedule='linear'`; a cosine schedule exists but is not used)
-- Optimizer: Adam-atan2 (constant LR, no scheduler), betas (0.9, 0.999), eps 1e-8
-- Learning rate: 2e-5
+- Optimizer: Adam-atan2, betas (0.9, 0.999), eps 1e-8
+- Learning rate: 2e-5 constant by default; optional per-epoch cosine annealing from 1e-4 to 2e-5 (`--lr_schedule cosine`)
 - Weight decay: 1e-6
 - Gradient clipping: max norm 1.0
 - EMA: decay 0.995, updated every 10 steps; used for validation and checkpoints
@@ -316,7 +320,7 @@ python evaluate.py \
 - Full smoke tests, including a small-model training epoch using the local dataset: `python -m pytest -q test_variable_length.py test_training.py quick_test.py`
 - Real-checkpoint notebook: `jupyter nbconvert --to notebook --execute --inplace test_random_constraints.ipynb --ExecutePreprocessor.timeout=600`
 - The training smoke test creates a new TensorBoard run under `test_checkpoints/logs`; it does not replace the production checkpoint. Checkpoint regression tests train a tiny model in temporary directories, verify new-format reload and legacy rejection, cover periodic/`latest.pt` saving, resume-from-next-epoch with RNG/EMA restoration, atomic-write failure handling, and execute the entire notebook against that test checkpoint without persisting its outputs.
-- The notebook normally reloads `checkpoints_kimodo/best_model.pt` and does not train or save weights. Train a new model before running it normally. Old notebook outputs are cleared to avoid presenting legacy predictions as new-model results.
+- The notebook normally reloads `checkpoints/latest.pt` and does not train or save weights. Train a new model before running it normally. Old notebook outputs are cleared to avoid presenting legacy predictions as new-model results.
 
 ## Troubleshooting
 
